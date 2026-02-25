@@ -28,11 +28,9 @@ export async function extractAllSellers(page, asin, marketplace, log) {
     log.info(`\n[${marketplace.code}] Loading offers: ${offerUrl}`);
 
     try {
-        await page.goto(offerUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await delay(2500);
+        await page.goto(offerUrl, { waitUntil: 'load', timeout: 45000 });
     } catch (err) {
-        log.warning(`[${marketplace.code}] Failed to load offer page: ${err.message}`);
-        return [];
+        log.warning(`[${marketplace.code}] Page load timeout, continuing anyway: ${err.message}`);
     }
 
     // Check if product exists on this marketplace
@@ -46,14 +44,22 @@ export async function extractAllSellers(page, asin, marketplace, log) {
         return [];
     }
 
-    // Check for cookie consent or CAPTCHA blocking the page
+    // Check for CAPTCHA
     const hasCaptcha = await page.$('form[action*="validateCaptcha"]') !== null;
     if (hasCaptcha) {
         log.warning(`[${marketplace.code}] CAPTCHA detected — skipping`);
         return [];
     }
 
-    // Extract sellers — the AOD panel is loaded in the DOM after redirect
+    // Wait for AOD offers to render (the page redirects and loads AOD dynamically)
+    try {
+        await page.waitForSelector('#aod-offer-list #aod-offer', { timeout: 15000 });
+    } catch {
+        log.info(`[${marketplace.code}] AOD offers did not load, trying fallback wait...`);
+        await delay(5000);
+    }
+
+    // Extract sellers
     const sellers = await page.$$eval('a[href*="/gp/aag/main"]', links => {
         return links.map(a => {
             const href = a.href;

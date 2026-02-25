@@ -53,11 +53,10 @@ const context = await browser.newContext({
 
 const page = await context.newPage();
 
-// Block unnecessary resources for speed
+// Only block non-essential resources (keep JS — needed for AOD panel rendering)
 await page.route('**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot}', route => route.abort());
 await page.route('**/doubleclick.net/**', route => route.abort());
 await page.route('**/google-analytics.com/**', route => route.abort());
-await page.route('**/googletagmanager.com/**', route => route.abort());
 
 // ── Scraping Loop ──────────────────────────────────────────────────────
 const allResults = [];
