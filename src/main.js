@@ -1,4 +1,4 @@
-import { Actor } from 'apify';
+import { Actor, log } from 'apify';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { MARKETPLACES } from './constants.js';
@@ -26,8 +26,6 @@ const asinsToProcess = maxAsins > 0 ? asins.slice(0, maxAsins) : asins;
 const marketplacesToScrape = selectedMarketplaces.length > 0
     ? MARKETPLACES.filter(m => selectedMarketplaces.includes(m.code))
     : MARKETPLACES;
-
-const log = Actor.log;
 
 log.info('=== Amazon Seller Scraper ===');
 log.info(`ASINs to process: ${asinsToProcess.length}`);
