@@ -17,103 +17,70 @@ export function delay(ms) {
 }
 
 /**
- * Step 1: Extract primary seller and check for other sellers on the product page.
- * Returns { primarySeller, hasOtherSellers, otherSellersCount }
+ * Extract all sellers from the offer listing page.
+ * We navigate directly to /gp/offer-listing/{ASIN} which redirects to
+ * the product page with the AOD panel already loaded in the DOM.
+ * This is much more reliable than clicking to open the AOD overlay.
  */
-export async function extractProductPageInfo(page, log) {
-    const result = {
-        primarySeller: null,
-        hasOtherSellers: false,
-        otherSellersCount: 0,
-    };
+export async function extractAllSellers(page, asin, marketplace, log) {
+    const offerUrl = `https://www.${marketplace.domain}/gp/offer-listing/${asin}/ref=dp_olp_NEW_mbc?condition=NEW`;
 
-    // Try to get primary seller link
+    log.info(`\n[${marketplace.code}] Loading offers: ${offerUrl}`);
+
     try {
-        result.primarySeller = await page.$eval(SELECTORS.PRIMARY_SELLER_LINK, el => {
-            const href = el.href;
-            const url = new URL(href, location.origin);
-            return {
-                name: el.textContent.trim(),
-                sellerId: url.searchParams.get('seller') || href.match(/seller=([A-Z0-9]+)/)?.[1],
-                href,
-            };
-        });
-        log.info(`  Primary seller: ${result.primarySeller.name} (${result.primarySeller.sellerId})`);
-    } catch {
-        // No seller link — likely sold by Amazon directly
-        try {
-            const merchantText = await page.$eval(SELECTORS.MERCHANT_INFO, el => el.innerText.trim());
-            log.info(`  Primary seller (no link): ${merchantText.replace(/\n/g, ' ')}`);
-        } catch {
-            log.info('  Could not determine primary seller');
-        }
-    }
-
-    // Check for "Other sellers" box
-    try {
-        const otherSellersText = await page.$eval(SELECTORS.OTHER_SELLERS_BOX, el =>
-            el.innerText.trim().replace(/\s+/g, ' ')
-        );
-        result.hasOtherSellers = true;
-        const countMatch = otherSellersText.match(/\((\d+)\)/);
-        result.otherSellersCount = countMatch ? parseInt(countMatch[1], 10) : 0;
-        log.info(`  Other sellers found: ${result.otherSellersCount}`);
-    } catch {
-        log.info('  No other sellers box found');
-    }
-
-    return result;
-}
-
-/**
- * Step 2: Open the All Offers Display panel and extract all sellers.
- * Returns array of { name, sellerId, href }
- */
-export async function extractSellersFromAOD(page, log) {
-    try {
-        // Click the "Other sellers" link
-        await page.click(SELECTORS.AOD_INGRESS_LINK);
-        await page.waitForSelector(SELECTORS.AOD_OFFER_LIST, { timeout: 10000 });
-        await delay(2000); // Allow panel to fully render
-
-        // Extract sellers from each offer block
-        const sellers = await page.$$eval(
-            `${SELECTORS.AOD_OFFER_LIST} ${SELECTORS.AOD_OFFER}`,
-            (offers, sellerLinkSelector) => {
-                return offers.map(offer => {
-                    const link = offer.querySelector(sellerLinkSelector);
-                    if (!link) return null;
-                    const href = link.href;
-                    let sellerId = null;
-                    try {
-                        sellerId = new URL(href).searchParams.get('seller');
-                    } catch {
-                        const match = href.match(/seller=([A-Z0-9]+)/);
-                        sellerId = match ? match[1] : null;
-                    }
-                    return {
-                        name: link.textContent.trim(),
-                        sellerId,
-                        href,
-                    };
-                }).filter(s => s && s.name && s.sellerId);
-            },
-            SELECTORS.SELLER_LINK_IN_OFFER
-        );
-
-        // Deduplicate by sellerId
-        const unique = [...new Map(sellers.map(s => [s.sellerId, s])).values()];
-        log.info(`  Extracted ${unique.length} unique sellers from AOD panel`);
-        return unique;
+        await page.goto(offerUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await delay(2500);
     } catch (err) {
-        log.warning(`  Failed to extract sellers from AOD: ${err.message}`);
+        log.warning(`[${marketplace.code}] Failed to load offer page: ${err.message}`);
         return [];
     }
+
+    // Check if product exists on this marketplace
+    const pageTitle = await page.title();
+    const currentUrl = page.url();
+
+    // Detect "not found" or error pages
+    if (pageTitle.includes('Page Not Found') || pageTitle.includes('404') ||
+        pageTitle.includes('Sorry') || currentUrl.includes('/errors/')) {
+        log.info(`[${marketplace.code}] Product not found on this marketplace`);
+        return [];
+    }
+
+    // Check for cookie consent or CAPTCHA blocking the page
+    const hasCaptcha = await page.$('form[action*="validateCaptcha"]') !== null;
+    if (hasCaptcha) {
+        log.warning(`[${marketplace.code}] CAPTCHA detected — skipping`);
+        return [];
+    }
+
+    // Extract sellers — the AOD panel is loaded in the DOM after redirect
+    const sellers = await page.$$eval('a[href*="/gp/aag/main"]', links => {
+        return links.map(a => {
+            const href = a.href;
+            let sellerId = null;
+            try {
+                sellerId = new URL(href).searchParams.get('seller');
+            } catch {
+                const match = href.match(/seller=([A-Z0-9]+)/);
+                sellerId = match ? match[1] : null;
+            }
+            return {
+                name: a.textContent.trim(),
+                sellerId,
+                href,
+            };
+        }).filter(s => s && s.name && s.sellerId);
+    }).catch(() => []);
+
+    // Deduplicate by sellerId
+    const unique = [...new Map(sellers.map(s => [s.sellerId, s])).values()];
+    log.info(`[${marketplace.code}] Found ${unique.length} seller(s)`);
+
+    return unique;
 }
 
 /**
- * Step 3: Navigate to a seller's profile page and extract business info.
- * Returns { sellerName, businessName, phoneNumber, email, ... }
+ * Navigate to a seller's profile page and extract business info.
  */
 export async function extractSellerInfo(page, sellerUrl, log) {
     try {
@@ -129,19 +96,14 @@ export async function extractSellerInfo(page, sellerUrl, log) {
 
             // Get seller rating info
             try {
-                const ratingLink = document.querySelector('a[href="#"][class*="link"]');
-                if (ratingLink) {
-                    const ratingText = ratingLink.closest('div')?.innerText?.trim();
-                    if (ratingText) {
-                        const ratingMatch = ratingText.match(/([\d.]+)\s*out of\s*5/);
-                        const percentMatch = ratingText.match(/(\d+)%\s*positive/);
-                        const countMatch = ratingText.match(/\((\d+)\s*ratings?\)/);
-                        result.rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
-                        result.positivePercent = percentMatch ? parseInt(percentMatch[1], 10) : null;
-                        result.ratingCount = countMatch ? parseInt(countMatch[1], 10) : null;
-                    }
-                }
-            } catch { /* ignore rating extraction errors */ }
+                const ratingText = document.body.innerText;
+                const ratingMatch = ratingText.match(/([\d.]+)\s*out of\s*5\s*stars/);
+                const percentMatch = ratingText.match(/(\d+)%\s*positive/);
+                const countMatch = ratingText.match(/\((\d[\d,]*)\s*ratings?\)/);
+                result.rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
+                result.positivePercent = percentMatch ? parseInt(percentMatch[1], 10) : null;
+                result.ratingCount = countMatch ? parseInt(countMatch[1].replace(/,/g, ''), 10) : null;
+            } catch { /* ignore */ }
 
             // Find "Detailed Seller Information" section
             const headings = Array.from(document.querySelectorAll('h3'));
@@ -149,6 +111,14 @@ export async function extractSellerInfo(page, sellerUrl, log) {
 
             if (!detailHeading) {
                 result.hasDetailedInfo = false;
+
+                // Fallback: check for "Customer Service Phone" in page text (UAE pattern)
+                const csPhoneMatch = document.body.innerText.match(/Customer Service Phone[:\s]+([^\n]+)/i);
+                if (csPhoneMatch) {
+                    result.phoneNumber = csPhoneMatch[1].trim();
+                    result.customerServicePhone = csPhoneMatch[1].trim();
+                }
+
                 return result;
             }
 
@@ -170,7 +140,6 @@ export async function extractSellerInfo(page, sellerUrl, log) {
                 const value = rest.join(':').trim();
 
                 if (value) {
-                    // Normalize common key variations
                     const keyLower = key.toLowerCase();
                     if (keyLower === 'business name') result.businessName = value;
                     else if (keyLower === 'business type') result.businessType = value;
@@ -192,84 +161,48 @@ export async function extractSellerInfo(page, sellerUrl, log) {
                 }
             }
 
-            // Fallback: check for "Customer Service Phone" outside Detailed Info (UAE pattern)
-            const fullPageText = document.body.innerText;
-            const csPhoneMatch = fullPageText.match(/Customer Service Phone[:\s]+([^\n]+)/i);
-            if (csPhoneMatch && !result.phoneNumber) {
-                result.phoneNumber = csPhoneMatch[1].trim();
-            }
+            // Also check for "Customer Service Phone" outside Detailed Info
+            const csPhoneMatch = document.body.innerText.match(/Customer Service Phone[:\s]+([^\n]+)/i);
             if (csPhoneMatch) {
                 result.customerServicePhone = csPhoneMatch[1].trim();
+                if (!result.phoneNumber) {
+                    result.phoneNumber = csPhoneMatch[1].trim();
+                }
             }
 
             return result;
         });
 
         if (info.sellerDisplayName) {
-            log.info(`    Seller: ${info.sellerDisplayName} | Phone: ${info.phoneNumber || 'N/A'} | Email: ${info.email || 'N/A'}`);
+            log.info(`    ${info.sellerDisplayName} | Phone: ${info.phoneNumber || 'N/A'} | Email: ${info.email || 'N/A'}`);
         }
 
         return info;
     } catch (err) {
-        log.warning(`    Failed to extract seller info from ${sellerUrl}: ${err.message}`);
+        log.warning(`    Failed to extract seller info: ${err.message}`);
         return { error: err.message };
     }
 }
 
 /**
  * Full scraping flow for one ASIN on one marketplace.
- * Returns array of seller data objects.
  */
 export async function scrapeAsinOnMarketplace(page, asin, marketplace, options, log) {
     const { skipAmazonSellers, delayBetweenRequests } = options;
-    const productUrl = `https://www.${marketplace.domain}/dp/${asin}`;
 
-    log.info(`\n[${marketplace.code}] Scraping ${productUrl}`);
+    // Step 1: Go directly to the offer listing page (loads AOD in DOM)
+    const allSellers = await extractAllSellers(page, asin, marketplace, log);
 
-    try {
-        await page.goto(productUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await delay(2000);
-    } catch (err) {
-        log.warning(`[${marketplace.code}] Failed to load product page: ${err.message}`);
-        return [];
-    }
-
-    // Check if product exists on this marketplace
-    const pageTitle = await page.title();
-    if (pageTitle.includes('Page Not Found') || pageTitle.includes('404') || pageTitle.includes('Sorry')) {
-        log.info(`[${marketplace.code}] Product not found on this marketplace`);
-        return [];
-    }
-
-    // Step 1: Get product page info
-    const productInfo = await extractProductPageInfo(page, log);
-
-    // Collect all sellers to visit
-    const sellersToVisit = [];
-
-    // Add primary seller if it has a link (not Amazon)
-    if (productInfo.primarySeller) {
-        if (skipAmazonSellers && isAmazonSeller(productInfo.primarySeller.name)) {
-            log.info(`  Skipping primary seller (Amazon): ${productInfo.primarySeller.name}`);
-        } else {
-            sellersToVisit.push(productInfo.primarySeller);
-        }
-    }
-
-    // Step 2: Get other sellers from AOD panel
-    if (productInfo.hasOtherSellers) {
-        const aodSellers = await extractSellersFromAOD(page, log);
-        for (const seller of aodSellers) {
-            if (skipAmazonSellers && isAmazonSeller(seller.name)) {
-                log.info(`  Skipping seller (Amazon): ${seller.name}`);
-                continue;
+    // Filter out Amazon sellers if needed
+    const sellersToVisit = skipAmazonSellers
+        ? allSellers.filter(s => {
+            if (isAmazonSeller(s.name)) {
+                log.info(`[${marketplace.code}] Skipping Amazon seller: ${s.name}`);
+                return false;
             }
-            // Avoid duplicates with primary seller
-            if (!sellersToVisit.find(s => s.sellerId === seller.sellerId)) {
-                sellersToVisit.push(seller);
-            }
-        }
-    }
+            return true;
+        })
+        : allSellers;
 
     if (sellersToVisit.length === 0) {
         log.info(`[${marketplace.code}] No third-party sellers to visit`);
@@ -278,14 +211,12 @@ export async function scrapeAsinOnMarketplace(page, asin, marketplace, options, 
 
     log.info(`[${marketplace.code}] Visiting ${sellersToVisit.length} seller profile(s)...`);
 
-    // Step 3: Visit each seller's profile page
+    // Step 2: Visit each seller's profile page
     const results = [];
     for (const seller of sellersToVisit) {
         await delay(delayBetweenRequests);
 
-        // Build seller profile URL
         const sellerProfileUrl = `https://www.${marketplace.domain}/sp?seller=${seller.sellerId}&asin=${asin}`;
-
         const sellerInfo = await extractSellerInfo(page, sellerProfileUrl, log);
 
         results.push({
