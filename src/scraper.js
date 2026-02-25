@@ -18,9 +18,9 @@ export function delay(ms) {
 
 /**
  * Extract all sellers from the offer listing page.
- * We navigate directly to /gp/offer-listing/{ASIN} which redirects to
- * the product page with the AOD panel already loaded in the DOM.
- * This is much more reliable than clicking to open the AOD overlay.
+ * The /gp/offer-listing/{ASIN} URL redirects to the product page
+ * with offers displayed inline (not in the AOD overlay).
+ * We look for seller links using multiple selector strategies.
  */
 export async function extractAllSellers(page, asin, marketplace, log) {
     const offerUrl = `https://www.${marketplace.domain}/gp/offer-listing/${asin}/ref=dp_olp_NEW_mbc?condition=NEW`;
@@ -33,9 +33,11 @@ export async function extractAllSellers(page, asin, marketplace, log) {
         log.warning(`[${marketplace.code}] Page load timeout, continuing anyway: ${err.message}`);
     }
 
-    // Check if product exists on this marketplace
-    const pageTitle = await page.title();
+    // Debug: log where we ended up
     const currentUrl = page.url();
+    const pageTitle = await page.title();
+    log.info(`[${marketplace.code}] Redirected to: ${currentUrl}`);
+    log.info(`[${marketplace.code}] Page title: ${pageTitle}`);
 
     // Detect "not found" or error pages
     if (pageTitle.includes('Page Not Found') || pageTitle.includes('404') ||
@@ -51,36 +53,127 @@ export async function extractAllSellers(page, asin, marketplace, log) {
         return [];
     }
 
-    // Wait for AOD offers to render (the page redirects and loads AOD dynamically)
-    try {
-        await page.waitForSelector('#aod-offer-list #aod-offer', { timeout: 15000 });
-    } catch {
-        log.info(`[${marketplace.code}] AOD offers did not load, trying fallback wait...`);
+    // Wait for the offers section to render — try multiple selectors
+    const offerSelectors = [
+        '#aod-offer-list #aod-offer',          // AOD overlay (if it loads)
+        '#aod-offer',                           // AOD offer without list wrapper
+        '#all-offers-display',                  // All offers display container
+        '#olpOfferList',                        // Older offer listing format
+        '.olpOffer',                            // Older offer listing items
+        '#ppd',                                 // Product page detail (offers inline)
+    ];
+
+    let foundSelector = null;
+    for (const sel of offerSelectors) {
+        try {
+            await page.waitForSelector(sel, { timeout: 5000 });
+            foundSelector = sel;
+            log.info(`[${marketplace.code}] Found offers with selector: ${sel}`);
+            break;
+        } catch {
+            // Try next selector
+        }
+    }
+
+    if (!foundSelector) {
+        log.info(`[${marketplace.code}] No offer container found, waiting 5s as fallback...`);
         await delay(5000);
     }
 
-    // Extract sellers
-    const sellers = await page.$$eval('a[href*="/gp/aag/main"]', links => {
-        return links.map(a => {
-            const href = a.href;
-            let sellerId = null;
+    // Debug: log what seller-related links exist on the page
+    const debugInfo = await page.evaluate(() => {
+        const allLinks = Array.from(document.querySelectorAll('a'));
+        const sellerLinks = allLinks.filter(a => {
+            const href = a.href || '';
+            return href.includes('seller=') || href.includes('/gp/aag/') ||
+                   href.includes('/sp?') || href.includes('/seller/');
+        });
+        return {
+            totalLinks: allLinks.length,
+            sellerLinkCount: sellerLinks.length,
+            sellerLinkSamples: sellerLinks.slice(0, 10).map(a => ({
+                text: a.textContent.trim().substring(0, 50),
+                href: a.href.substring(0, 150),
+            })),
+            hasAodOfferList: !!document.querySelector('#aod-offer-list'),
+            hasAodOffer: !!document.querySelector('#aod-offer'),
+            hasPpd: !!document.querySelector('#ppd'),
+            // Check for "Sold by" text patterns
+            soldByTexts: Array.from(document.querySelectorAll('*')).filter(el =>
+                el.children.length === 0 && el.textContent.trim().match(/^sold by$/i)
+            ).length,
+        };
+    }).catch(() => ({}));
+
+    log.info(`[${marketplace.code}] Debug: ${JSON.stringify(debugInfo)}`);
+
+    // Extract sellers using multiple strategies
+    const sellers = await page.evaluate(() => {
+        const found = [];
+        const seenIds = new Set();
+
+        // Helper to extract seller ID from a URL
+        function extractSellerId(href) {
+            if (!href) return null;
             try {
-                sellerId = new URL(href).searchParams.get('seller');
+                const url = new URL(href);
+                return url.searchParams.get('seller') || url.searchParams.get('sellerID');
             } catch {
-                const match = href.match(/seller=([A-Z0-9]+)/);
-                sellerId = match ? match[1] : null;
+                const match = href.match(/seller=([A-Z0-9]+)/i);
+                return match ? match[1] : null;
             }
-            return {
-                name: a.textContent.trim(),
-                sellerId,
-                href,
-            };
-        }).filter(s => s && s.name && s.sellerId);
+        }
+
+        // Strategy 1: Links to /gp/aag/main (seller storefront)
+        document.querySelectorAll('a[href*="/gp/aag/main"]').forEach(a => {
+            const sellerId = extractSellerId(a.href);
+            const name = a.textContent.trim();
+            if (sellerId && name && !seenIds.has(sellerId)) {
+                seenIds.add(sellerId);
+                found.push({ name, sellerId, href: a.href, strategy: 'aag' });
+            }
+        });
+
+        // Strategy 2: Links containing seller= parameter (covers /sp?seller=, etc.)
+        document.querySelectorAll('a[href*="seller="]').forEach(a => {
+            const sellerId = extractSellerId(a.href);
+            const name = a.textContent.trim();
+            if (sellerId && name && !seenIds.has(sellerId)) {
+                seenIds.add(sellerId);
+                found.push({ name, sellerId, href: a.href, strategy: 'sellerParam' });
+            }
+        });
+
+        // Strategy 3: "Sold by" pattern — find text "Sold by" followed by a link
+        document.querySelectorAll('a').forEach(a => {
+            const prevText = a.previousSibling?.textContent || '';
+            const parentText = a.parentElement?.textContent || '';
+            if ((prevText.toLowerCase().includes('sold by') ||
+                 parentText.toLowerCase().includes('sold by')) &&
+                a.href && !a.href.includes('#')) {
+                const sellerId = extractSellerId(a.href);
+                const name = a.textContent.trim();
+                if (sellerId && name && !seenIds.has(sellerId)) {
+                    seenIds.add(sellerId);
+                    found.push({ name, sellerId, href: a.href, strategy: 'soldBy' });
+                } else if (name && !sellerId && a.href.includes('/sp')) {
+                    // Try to extract from href path
+                    const match = a.href.match(/seller[=\/]([A-Z0-9]+)/i);
+                    const id = match ? match[1] : null;
+                    if (id && !seenIds.has(id)) {
+                        seenIds.add(id);
+                        found.push({ name, sellerId: id, href: a.href, strategy: 'soldByPath' });
+                    }
+                }
+            }
+        });
+
+        return found;
     }).catch(() => []);
 
     // Deduplicate by sellerId
     const unique = [...new Map(sellers.map(s => [s.sellerId, s])).values()];
-    log.info(`[${marketplace.code}] Found ${unique.length} seller(s)`);
+    log.info(`[${marketplace.code}] Found ${unique.length} seller(s): ${unique.map(s => `${s.name}(${s.strategy})`).join(', ')}`);
 
     return unique;
 }
